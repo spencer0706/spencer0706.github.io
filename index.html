@@ -1,0 +1,1021 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Table Blocks</title>
+<link rel="manifest" href="manifest.webmanifest">
+<link rel="icon" href="icon-192.png">
+<meta name="theme-color" content="#1b1d22">
+<style>
+  html, body { margin: 0; height: 100%; overflow: hidden; background: #1b1d22; color: #eee; font-family: system-ui, sans-serif; }
+  canvas { display: block; }
+  #ui { position: fixed; left: 0; right: 0; bottom: 0; padding: 28px 16px; display: flex; flex-direction: column; align-items: center; gap: 12px;
+        background: linear-gradient(transparent, rgba(0,0,0,.75)); }
+  h1 { margin: 0; font-size: 26px; }
+  #msg { font-size: 15px; opacity: .85; text-align: center; max-width: 520px; line-height: 1.4; }
+  button { font-size: 20px; padding: 14px 32px; border-radius: 999px; border: 0; background: #4d96ff; color: #fff; cursor: pointer; }
+  button:disabled { background: #555; cursor: default; }
+</style>
+<script type="importmap">
+{ "imports": {
+  "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js",
+  "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/",
+  "cannon-es": "https://cdn.jsdelivr.net/npm/cannon-es@0.20.0/dist/cannon-es.js"
+} }
+</script>
+</head>
+<body>
+<div id="ui">
+  <h1>Table Blocks</h1>
+  <div id="msg">Checking for mixed reality support…</div>
+  <button id="start" disabled>Start</button>
+</div>
+
+<script type="module">
+import * as THREE from 'three';
+import * as CANNON from 'cannon-es';
+import { RoundedBoxGeometry } from 'three/addons/geometries/RoundedBoxGeometry.js';
+
+// ---------- Settings ----------
+// size = [width, height, depth] in meters (bounding box)
+const BLOCK_DEFS = [
+  ...Array(4).fill({ type: 'box', size: [0.06, 0.06, 0.06] }),   // cubes
+  ...Array(2).fill({ type: 'box', size: [0.12, 0.06, 0.06] }),   // bricks
+  ...Array(1).fill({ type: 'box', size: [0.18, 0.03, 0.06] }),   // plank
+  ...Array(2).fill({ type: 'cyl', size: [0.06, 0.09, 0.06] }),   // cylinders
+  ...Array(2).fill({ type: 'wedge', size: [0.08, 0.05, 0.06] }), // triangle roofs
+  ...Array(1).fill({ type: 'arch', size: [0.18, 0.09, 0.06] }),  // arch
+];
+const COLORS = [0xff6b6b, 0xffb347, 0xffe066, 0x6bcb77, 0x4d96ff, 0xb983ff];
+const GRAB_RADIUS = 0.035;       // how close (m) a pinch must be to a block's surface
+const PINCH_ON = 0.018, PINCH_OFF = 0.04;
+
+// ---------- Helpers ----------
+const v3 = p => new THREE.Vector3(p.x, p.y, p.z);
+const q4 = o => new THREE.Quaternion(o.x, o.y, o.z, o.w);
+const UP = new THREE.Vector3(0, 1, 0);
+
+// ---------- Renderer / scene ----------
+const renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
+renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+renderer.setSize(innerWidth, innerHeight);
+renderer.shadowMap.enabled = true;
+renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+renderer.xr.enabled = true;
+renderer.xr.setReferenceSpaceType('local-floor');
+document.body.prepend(renderer.domElement);
+
+const scene = new THREE.Scene();
+const previewBg = new THREE.Color(0x1b1d22);
+scene.background = previewBg;
+
+const camera = new THREE.PerspectiveCamera(55, innerWidth / innerHeight, 0.01, 50);
+camera.position.set(0, 1.25, 0.25);
+camera.lookAt(0, 0.78, -0.55);
+addEventListener('resize', () => {
+  camera.aspect = innerWidth / innerHeight; camera.updateProjectionMatrix();
+  renderer.setSize(innerWidth, innerHeight);
+});
+
+scene.add(new THREE.HemisphereLight(0xffffff, 0x667788, 1.3));
+const sun = new THREE.DirectionalLight(0xffffff, 1.6);
+sun.castShadow = true;
+sun.shadow.mapSize.set(1024, 1024);
+Object.assign(sun.shadow.camera, { left: -0.6, right: 0.6, top: 0.6, bottom: -0.6, near: 0.1, far: 3 });
+sun.shadow.bias = -0.0005;
+scene.add(sun, sun.target);
+
+// ---------- Physics ----------
+const world = new CANNON.World({ gravity: new CANNON.Vec3(0, -9.82, 0) });
+world.broadphase = new CANNON.SAPBroadphase(world);
+world.allowSleep = true;
+// Tuned so stacks stay put: stiff friction stops slow sideways creep, and resting
+// blocks go to sleep quickly so they can't drift at all until something touches them.
+world.solver.iterations = 40;
+world.solver.tolerance = 1e-7;
+Object.assign(world.defaultContactMaterial, {
+  friction: 0.8, restitution: 0,
+  contactEquationStiffness: 1e7, contactEquationRelaxation: 3,
+  frictionEquationStiffness: 1e8, frictionEquationRelaxation: 2,
+});
+
+const floorBody = new CANNON.Body({ type: CANNON.Body.STATIC, shape: new CANNON.Plane() });
+floorBody.quaternion.setFromEuler(-Math.PI / 2, 0, 0);
+world.addBody(floorBody);
+
+// ---------- Table ----------
+let table = null;               // { center, quat, up, w, d, body, objects[] }
+let flash = null;               // scan outline that fades out
+let dropTimers = [];
+
+function clearTable() {
+  if (!table) return;
+  world.removeBody(table.body);
+  table.objects.forEach(o => scene.remove(o));
+  table = null;
+}
+
+function setTable(center, quat, w, d, { preview = false } = {}) {
+  clearTable();
+  const thick = 0.1;
+  const up = UP.clone().applyQuaternion(quat);
+  const bodyPos = center.clone().addScaledVector(up, -thick / 2);
+  const body = new CANNON.Body({ type: CANNON.Body.STATIC, shape: new CANNON.Box(new CANNON.Vec3(w / 2, thick / 2, d / 2)) });
+  body.position.set(bodyPos.x, bodyPos.y, bodyPos.z);
+  body.quaternion.set(quat.x, quat.y, quat.z, quat.w);
+  world.addBody(body);
+
+  const objects = [];
+  if (preview) { // a visible wooden table for the desktop preview only
+    const top = new THREE.Mesh(new THREE.BoxGeometry(w, thick, d), new THREE.MeshStandardMaterial({ color: 0x8a6a4a, roughness: 0.8 }));
+    top.position.copy(bodyPos); top.quaternion.copy(quat); top.receiveShadow = true;
+    objects.push(top);
+  }
+  // Invisible surface that only shows shadows, so blocks look grounded on the real table.
+  const shadow = new THREE.Mesh(new THREE.PlaneGeometry(w + 0.3, d + 0.3), new THREE.ShadowMaterial({ opacity: 0.35 }));
+  shadow.rotation.x = -Math.PI / 2;
+  const shadowHolder = new THREE.Group();
+  shadowHolder.position.copy(center).addScaledVector(up, 0.001);
+  shadowHolder.quaternion.copy(quat);
+  shadowHolder.add(shadow);
+  shadow.receiveShadow = true;
+  objects.push(shadowHolder);
+  const zenTable = preview ? null : buildZenTable(center, quat, w, d);
+  if (zenTable) objects.push(zenTable);
+  objects.forEach(o => scene.add(o));
+
+  sun.position.copy(center).add(new THREE.Vector3(0.3, 1.5, 0.4));
+  sun.target.position.copy(center);
+
+  table = { center: center.clone(), quat: quat.clone(), up, w, d, body, objects, zenTable };
+  showScanFlash();
+}
+
+function showScanFlash() {
+  if (flash) scene.remove(flash.group);
+  const { w, d } = table;
+  const group = new THREE.Group();
+  group.position.copy(table.center).addScaledVector(table.up, 0.003);
+  group.quaternion.copy(table.quat);
+  const pts = [[-w/2, -d/2], [w/2, -d/2], [w/2, d/2], [-w/2, d/2]].map(([x, z]) => new THREE.Vector3(x, 0, z));
+  const lineMat = new THREE.LineBasicMaterial({ color: 0x5ef2ff, transparent: true });
+  group.add(new THREE.LineLoop(new THREE.BufferGeometry().setFromPoints(pts), lineMat));
+  const fillMat = new THREE.MeshBasicMaterial({ color: 0x5ef2ff, transparent: true, opacity: 0.18, depthWrite: false });
+  const fill = new THREE.Mesh(new THREE.PlaneGeometry(w, d), fillMat);
+  fill.rotation.x = -Math.PI / 2;
+  group.add(fill);
+  scene.add(group);
+  flash = { group, lineMat, fillMat, t: 0 };
+}
+
+// ---------- Blocks ----------
+// Extrude a 2D outline (in X/Y) to depth d, centered, with slightly rounded edges.
+function extrude(shape, d) {
+  const bt = 0.003;
+  const g = new THREE.ExtrudeGeometry(shape, { depth: d - 2 * bt, bevelEnabled: true, bevelThickness: bt, bevelSize: bt, bevelSegments: 2, curveSegments: 24 });
+  g.translate(0, 0, -(d - 2 * bt) / 2);
+  return g;
+}
+
+// Returns the visible geometry, the physics shapes, and how "full" the bounding box is (for mass).
+function buildShape({ type, size: [w, h, d] }) {
+  const V = (x, y, z) => new CANNON.Vec3(x, y, z);
+  if (type === 'cyl') {
+    const r = w / 2;
+    return { geo: new THREE.CylinderGeometry(r, r, h, 28), shapes: [[new CANNON.Cylinder(r, r, h, 14)]], fill: 0.785 };
+  }
+  if (type === 'wedge') {
+    const i = 0.003, s = new THREE.Shape();  // inset so the bevel lands on the true size
+    s.moveTo(-w / 2 + i, -h / 2 + i); s.lineTo(w / 2 - i, -h / 2 + i); s.lineTo(0, h / 2 - i); s.closePath();
+    const verts = [V(-w/2, -h/2, -d/2), V(w/2, -h/2, -d/2), V(0, h/2, -d/2), V(-w/2, -h/2, d/2), V(w/2, -h/2, d/2), V(0, h/2, d/2)];
+    const faces = [[0, 2, 1], [3, 4, 5], [0, 1, 4, 3], [1, 2, 5, 4], [2, 0, 3, 5]];
+    return { geo: extrude(s, d), shapes: [[new CANNON.ConvexPolyhedron({ vertices: verts, faces })]], fill: 0.5 };
+  }
+  if (type === 'arch') {
+    const leg = 0.04, a = w / 2 - leg, cy = h / 2 - 0.02 - a, i = 0.003;
+    const s = new THREE.Shape();
+    s.moveTo(-w / 2 + i, -h / 2 + i); s.lineTo(-a - i, -h / 2 + i); s.lineTo(-a - i, cy);
+    s.absarc(0, cy, a + i, Math.PI, 0, true);
+    s.lineTo(a + i, -h / 2 + i); s.lineTo(w / 2 - i, -h / 2 + i); s.lineTo(w / 2 - i, h / 2 - i); s.lineTo(-w / 2 + i, h / 2 - i); s.closePath();
+    const beamBottom = 0.015;   // physics: two legs + a top beam that roughly follows the curve
+    return {
+      geo: extrude(s, d), fill: 0.6,
+      shapes: [
+        [new CANNON.Box(V(leg / 2, h / 2, d / 2)), V(-w / 2 + leg / 2, 0, 0)],
+        [new CANNON.Box(V(leg / 2, h / 2, d / 2)), V(w / 2 - leg / 2, 0, 0)],
+        [new CANNON.Box(V(a, (h / 2 - beamBottom) / 2, d / 2)), V(0, (beamBottom + h / 2) / 2, 0)],
+      ],
+    };
+  }
+  return { geo: new RoundedBoxGeometry(w, h, d, 3, Math.min(w, h, d) * 0.12), shapes: [[new CANNON.Box(V(w / 2, h / 2, d / 2))]], fill: 1 };
+}
+
+const blocks = BLOCK_DEFS.map((def, i) => {
+  const [w, h, d] = def.size;
+  const { geo, shapes, fill } = buildShape(def);
+  const mesh = new THREE.Mesh(geo, new THREE.MeshStandardMaterial({ color: COLORS[i % COLORS.length], roughness: 0.55 }));
+  mesh.castShadow = mesh.receiveShadow = true;
+  mesh.visible = false;
+  scene.add(mesh);
+  const half = new THREE.Vector3(w / 2, h / 2, d / 2);
+  const body = new CANNON.Body({
+    mass: 600 * w * h * d * fill, // roughly wood
+    linearDamping: 0.1, angularDamping: 0.4, sleepSpeedLimit: 0.1, sleepTimeLimit: 0.4,
+  });
+  for (const [shape, offset] of shapes) body.addShape(shape, offset);
+  return { mesh, body, half, active: false, heldBy: null, fallenAt: null, target: null };
+});
+
+function hideBlocks() {
+  dropTimers.forEach(clearTimeout); dropTimers = [];
+  for (const b of blocks) {
+    if (b.active) world.removeBody(b.body);
+    b.active = false; b.mesh.visible = false; b.heldBy = null;
+  }
+}
+
+function spawnBlock(b, { respawn = false } = {}) {
+  if (!table) return;
+  let local;
+  if (respawn) {
+    // Knocked-off block: bring it back in the emptiest spot so it can't land on your builds.
+    let bestScore = -1;
+    for (let k = 0; k < 16; k++) {
+      const cand = new THREE.Vector3((Math.random() - 0.5) * table.w * 0.8, 0, (Math.random() - 0.5) * table.d * 0.8).applyQuaternion(table.quat);
+      const wp = table.center.clone().add(cand);
+      let nearest = Infinity;
+      for (const o of blocks) if (o !== b && o.active) nearest = Math.min(nearest, Math.hypot(o.body.position.x - wp.x, o.body.position.z - wp.z));
+      if (nearest > bestScore) { bestScore = nearest; local = cand; }
+    }
+  } else {
+    const spread = Math.min(0.2, Math.min(table.w, table.d) * 0.3);
+    local = new THREE.Vector3((Math.random() - 0.5) * 2 * spread, 0, (Math.random() - 0.5) * 2 * spread).applyQuaternion(table.quat);
+  }
+  const p = table.center.clone().add(local).addScaledVector(table.up, respawn ? 0.35 : 0.8 + Math.random() * 0.3);
+  const body = b.body;
+  body.type = CANNON.Body.DYNAMIC;
+  body.allowSleep = true;
+  body.position.set(p.x, p.y, p.z);
+  body.quaternion.setFromEuler(Math.random() * 6.28, Math.random() * 6.28, Math.random() * 6.28);
+  body.velocity.set(0, 0, 0);
+  body.angularVelocity.set((Math.random() - 0.5) * 4, (Math.random() - 0.5) * 4, (Math.random() - 0.5) * 4);
+  if (!b.active) world.addBody(body);
+  body.wakeUp();
+  b.active = true; b.mesh.visible = true; b.fallenAt = null;
+}
+
+function dropBlocks(delay = 600) {
+  hideBlocks();
+  // shuffled order so the new shapes are mixed into the pile
+  [...blocks].sort(() => Math.random() - 0.5).forEach((b, i) => dropTimers.push(setTimeout(() => spawnBlock(b), delay + i * 140)));
+}
+
+function blockDistance(b, p) {
+  const local = p.clone().sub(v3(b.body.position)).applyQuaternion(q4(b.body.quaternion).invert());
+  return Math.hypot(
+    Math.max(Math.abs(local.x) - b.half.x, 0),
+    Math.max(Math.abs(local.y) - b.half.y, 0),
+    Math.max(Math.abs(local.z) - b.half.z, 0));
+}
+
+// ---------- In-headset instruction panel ----------
+const panelCanvas = document.createElement('canvas');
+panelCanvas.width = 1024; panelCanvas.height = 320;
+const panelTex = new THREE.CanvasTexture(panelCanvas);
+panelTex.colorSpace = THREE.SRGBColorSpace;
+const panel = new THREE.Mesh(new THREE.PlaneGeometry(0.42, 0.13125),
+  new THREE.MeshBasicMaterial({ map: panelTex, transparent: true, depthTest: false }));
+panel.renderOrder = 10; panel.visible = false;
+scene.add(panel);
+let panelText = '';
+function setPanel(title, sub = '') {
+  const key = title + '|' + sub;
+  panel.visible = true;
+  if (key === panelText) return;
+  panelText = key;
+  const c = panelCanvas.getContext('2d');
+  c.clearRect(0, 0, 1024, 320);
+  c.fillStyle = 'rgba(20,22,28,0.82)';
+  c.beginPath(); c.roundRect(8, 8, 1008, 304, 60); c.fill();
+  c.fillStyle = '#fff'; c.textAlign = 'center';
+  const lines = sub ? sub.split('\n') : [];
+  const titleY = lines.length === 2 ? 115 : lines.length ? 140 : 180;
+  c.font = 'bold 64px system-ui, sans-serif'; c.fillText(title, 512, titleY);
+  c.font = '40px system-ui, sans-serif'; c.fillStyle = '#cfd6e4';
+  lines.forEach((l, i) => c.fillText(l, 512, titleY + 75 + i * 55));
+  panelTex.needsUpdate = true;
+}
+let panelTimer = null;
+function flashPanel(title, sub, ms) {
+  setPanel(title, sub);
+  clearTimeout(panelTimer);
+  panelTimer = setTimeout(() => { if (phase === 'play') panel.visible = false; }, ms);
+}
+function followHead(headPos, headFwd, dt) {
+  const target = headPos.clone().addScaledVector(headFwd, 0.7).add(new THREE.Vector3(0, -0.12, 0));
+  panel.position.lerp(target, 1 - Math.exp(-dt * 4));
+  panel.lookAt(headPos);
+}
+
+// Progress rings: one under a fingertip while touching a corner, or above each palm during a gesture.
+const rings = [0, 1].map(() => {
+  const r = new THREE.Mesh(new THREE.RingGeometry(0.014, 0.02, 40),
+    new THREE.MeshBasicMaterial({ color: 0x5ef2ff, transparent: true, side: THREE.DoubleSide, depthTest: false }));
+  r.rotation.x = -Math.PI / 2; r.renderOrder = 11; r.visible = false;
+  scene.add(r);
+  return r;
+});
+function showRing(i, pos, progress, color = 0x5ef2ff) {
+  const r = rings[i];
+  r.visible = true; r.position.copy(pos);
+  r.scale.setScalar(1.8 - 0.8 * progress);
+  r.material.opacity = Math.max(0.15, progress); r.material.color.setHex(color);
+}
+
+// Corner marker + live rectangle while measuring the table with two touches.
+const cornerDot = new THREE.Mesh(new THREE.SphereGeometry(0.008, 16, 12), new THREE.MeshBasicMaterial({ color: 0x5ef2ff, depthTest: false }));
+cornerDot.renderOrder = 11; cornerDot.visible = false;
+const cornerLine = new THREE.LineLoop(new THREE.BufferGeometry().setAttribute('position', new THREE.BufferAttribute(new Float32Array(12), 3)),
+  new THREE.LineBasicMaterial({ color: 0x5ef2ff, depthTest: false }));
+cornerLine.renderOrder = 11; cornerLine.visible = false; cornerLine.frustumCulled = false;
+scene.add(cornerDot, cornerLine);
+
+// ---------- App state ----------
+let phase = 'preview';          // 'preview' | 'find' | 'play'
+let findStart = 0;
+let cornerA = null, cornerYaw = null;
+const inputs = new Map();       // XRInputSource -> state
+
+function startPreview() {
+  phase = 'preview';
+  scene.background = previewBg;
+  panel.visible = false; rings.forEach(r => r.visible = false);
+  cornerDot.visible = cornerLine.visible = false;
+  setTable(new THREE.Vector3(0, 0.75, -0.55), new THREE.Quaternion(), 0.9, 0.55, { preview: true });
+  flash && (flash.t = 99);
+  dropBlocks(300);
+}
+
+function startFind(time) {
+  phase = 'find';
+  scene.background = null;      // let passthrough show
+  clearTable(); hideBlocks();
+  findStart = time;
+  cornerA = cornerYaw = null;
+  cornerDot.visible = cornerLine.visible = false;
+  clearTimeout(panelTimer);
+  for (const s of inputs.values()) { release(s); s.touchAnchor = null; }
+  panelText = '';
+  setPanel('Looking for your table…', 'Look toward your table or desk');
+}
+
+function tableFound() {
+  phase = 'play';
+  rings.forEach(r => r.visible = false);
+  cornerDot.visible = cornerLine.visible = false;
+  flashPanel('Found it!', 'Pinch to grab blocks\nLook at your left palm for the menu', 5000);
+  dropBlocks(700);
+}
+
+// First touch = one corner, second touch = the opposite corner.
+function placeCorner(p, yawQuat) {
+  if (!cornerA) {
+    cornerA = p.clone(); cornerYaw = yawQuat.clone();
+    cornerDot.position.copy(p); cornerDot.visible = true;
+    for (const s of inputs.values()) s.touchAnchor = null;
+    return;
+  }
+  const delta = p.clone().sub(cornerA).applyQuaternion(cornerYaw.clone().invert());
+  const w = Math.max(0.3, Math.abs(delta.x)), d = Math.max(0.3, Math.abs(delta.z));
+  setTable(cornerA.clone().add(p).multiplyScalar(0.5), cornerYaw, w, d);
+  tableFound();
+}
+
+function updateCornerPreview(tip) {
+  if (!cornerA || !tip) { cornerLine.visible = false; return; }
+  const inv = cornerYaw.clone().invert();
+  const delta = tip.clone().sub(cornerA).applyQuaternion(inv);
+  const corners = [[0, 0], [delta.x, 0], [delta.x, delta.z], [0, delta.z]];
+  const arr = cornerLine.geometry.attributes.position.array;
+  corners.forEach(([x, z], i) => {
+    const p = new THREE.Vector3(x, 0, z).applyQuaternion(cornerYaw).add(cornerA);
+    arr.set([p.x, p.y, p.z], i * 3);
+  });
+  cornerLine.geometry.attributes.position.needsUpdate = true;
+  cornerLine.visible = true;
+}
+
+// ---------- Zen music (generated live with Web Audio — no audio files) ----------
+const music = (() => {
+  let ctx = null, master, dry, wet, sfx, timer = null, nextAt = 0, chordIdx = 0, enabled = true;
+  const CHORDS = [[48, 55, 60, 64, 71], [45, 52, 57, 60, 67], [41, 48, 53, 57, 64], [43, 50, 55, 59, 62]]; // Cmaj7 · Am7 · Fmaj7 · G6
+  const PENTA = [72, 74, 76, 79, 81, 84, 86, 88];   // C major pentatonic, high and gentle
+  const CHORD_LEN = 9;
+  const hz = m => 440 * Math.pow(2, (m - 69) / 12);
+
+  function init() {
+    ctx = new AudioContext();
+    const comp = ctx.createDynamicsCompressor();
+    comp.connect(ctx.destination);
+    master = ctx.createGain(); master.gain.value = 0; master.connect(comp);
+    // reverb from a generated, softly decaying noise tail
+    const len = ctx.sampleRate * 5, ir = ctx.createBuffer(2, len, ctx.sampleRate);
+    for (let ch = 0; ch < 2; ch++) { const d = ir.getChannelData(ch); for (let i = 0; i < len; i++) d[i] = (Math.random() * 2 - 1) * Math.pow(1 - i / len, 3); }
+    const verb = ctx.createConvolver(); verb.buffer = ir; verb.connect(master);
+    wet = ctx.createGain(); wet.gain.value = 0.7; wet.connect(verb);
+    dry = ctx.createGain(); dry.gain.value = 0.45; dry.connect(master);
+    sfx = ctx.createGain(); sfx.gain.value = 1; sfx.connect(comp);
+  }
+  function pad(t, notes) {
+    const lp = ctx.createBiquadFilter(); lp.type = 'lowpass'; lp.frequency.value = 750; lp.Q.value = 0.2;
+    const g = ctx.createGain();
+    g.gain.setValueAtTime(0, t); g.gain.linearRampToValueAtTime(0.045, t + 3);
+    g.gain.setValueAtTime(0.045, t + CHORD_LEN - 1); g.gain.linearRampToValueAtTime(0, t + CHORD_LEN + 3);
+    lp.connect(g); g.connect(dry); g.connect(wet);
+    const voices = [...notes.map(n => [n, 'triangle', 1]), [notes[0] - 12, 'sine', 1.6]];
+    for (const [n, type, amp] of voices) for (const det of [-6, 6]) {
+      const o = ctx.createOscillator(), og = ctx.createGain();
+      o.type = type; o.frequency.value = hz(n); o.detune.value = det; og.gain.value = amp * 0.5;
+      o.connect(og).connect(lp); o.start(t); o.stop(t + CHORD_LEN + 3.2);
+    }
+  }
+  function chime(t) {
+    const f = hz(PENTA[Math.floor(Math.random() * PENTA.length)]);
+    const g = ctx.createGain();
+    g.gain.setValueAtTime(0, t); g.gain.linearRampToValueAtTime(0.035, t + 0.02); g.gain.exponentialRampToValueAtTime(0.0001, t + 4.5);
+    g.connect(wet); g.connect(dry);
+    for (const [mul, amp] of [[1, 1], [2.01, 0.25], [3.02, 0.08]]) {   // soft bell partials
+      const o = ctx.createOscillator(), og = ctx.createGain();
+      o.type = 'sine'; o.frequency.value = f * mul; og.gain.value = amp;
+      o.connect(og).connect(g); o.start(t); o.stop(t + 4.6);
+    }
+  }
+  function schedule() {
+    while (nextAt < ctx.currentTime + 1.5) {
+      pad(nextAt, CHORDS[chordIdx++ % CHORDS.length]);
+      const n = 1 + Math.floor(Math.random() * 3);
+      for (let i = 0; i < n; i++) chime(nextAt + 1 + Math.random() * (CHORD_LEN - 1));
+      nextAt += CHORD_LEN;
+    }
+  }
+  function play() {
+    if (!ctx) return;
+    ctx.resume();
+    nextAt = Math.max(nextAt, ctx.currentTime + 0.1);
+    schedule();
+    timer ??= setInterval(schedule, 500);
+    master.gain.cancelScheduledValues(ctx.currentTime);
+    master.gain.setTargetAtTime(0.9, ctx.currentTime, 1.2);
+  }
+  function quiet() {
+    if (!ctx) return;
+    clearInterval(timer); timer = null;
+    master.gain.cancelScheduledValues(ctx.currentTime);
+    master.gain.setTargetAtTime(0, ctx.currentTime, 0.4);
+  }
+  return {
+    get enabled() { return enabled; },
+    start() { if (!ctx) init(); ctx.resume(); if (enabled) play(); },   // call from a tap (browser audio rule)
+    stop() { quiet(); },
+    set(on) { enabled = on; on ? play() : quiet(); },
+    click() {   // soft tick for menu presses
+      if (!ctx) return;
+      const t = ctx.currentTime, o = ctx.createOscillator(), g = ctx.createGain();
+      o.type = 'sine'; o.frequency.setValueAtTime(1100, t); o.frequency.exponentialRampToValueAtTime(700, t + 0.08);
+      g.gain.setValueAtTime(0.06, t); g.gain.exponentialRampToValueAtTime(0.0001, t + 0.12);
+      o.connect(g).connect(sfx); o.start(t); o.stop(t + 0.13);
+    },
+    get state() { return ctx ? ctx.state : 'not started'; },
+  };
+})();
+
+// ---------- Zen world (full VR) ----------
+// A soft dusk sky, an endless pale ground, drifting light motes, a virtual table and visible hands.
+// It fades in over the passthrough, so your measured table and blocks stay exactly where they are.
+const zenMats = [];
+function zenMat(m, base = 1) { m.transparent = true; m.userData.base = base; zenMats.push(m); return m; }
+const HORIZON = new THREE.Color(0xf2dccb);
+const zenGroup = new THREE.Group(); zenGroup.visible = false; scene.add(zenGroup);
+scene.fog = new THREE.Fog(HORIZON, 1e4, 2e4);   // only pulled in while the zen world is showing
+
+const skyMat = zenMat(new THREE.ShaderMaterial({
+  side: THREE.BackSide, depthWrite: false,
+  uniforms: {
+    opacity: { value: 0 },
+    top: { value: new THREE.Color(0x86a3cc) }, horizon: { value: HORIZON.clone() }, bottom: { value: new THREE.Color(0xe4d8c8) },
+    sunDir: { value: new THREE.Vector3(0.35, 0.1, -1).normalize() },
+  },
+  vertexShader: `varying vec3 vDir; void main() { vDir = position; gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0); }`,
+  fragmentShader: `
+    uniform vec3 top; uniform vec3 horizon; uniform vec3 bottom; uniform vec3 sunDir; uniform float opacity;
+    varying vec3 vDir;
+    void main() {
+      vec3 d = normalize(vDir);
+      vec3 col = d.y > 0.0 ? mix(horizon, top, pow(d.y, 0.55)) : mix(horizon, bottom, smoothstep(0.0, 0.15, -d.y));
+      float s = max(dot(d, sunDir), 0.0);
+      col += vec3(1.0, 0.86, 0.7) * (pow(s, 400.0) * 0.8 + pow(s, 8.0) * 0.18);
+      gl_FragColor = vec4(col, opacity);
+      #include <colorspace_fragment>
+    }`,
+}));
+const sky = new THREE.Mesh(new THREE.SphereGeometry(45, 48, 24), skyMat);
+sky.renderOrder = -2; sky.position.y = 1.5;
+const ground = new THREE.Mesh(new THREE.CircleGeometry(40, 72), zenMat(new THREE.MeshStandardMaterial({ color: 0xe0d5c5, roughness: 1 })));
+ground.rotation.x = -Math.PI / 2; ground.position.y = 0.001;
+const stoneCircle = new THREE.Mesh(new THREE.CircleGeometry(1.4, 72), zenMat(new THREE.MeshStandardMaterial({ color: 0xcfbfa9, roughness: 1 })));
+stoneCircle.rotation.x = -Math.PI / 2; stoneCircle.position.y = 0.002;
+zenGroup.add(sky, ground, stoneCircle);
+
+// drifting motes of light
+const MOTES = 260;
+const moteBase = new Float32Array(MOTES * 3), motePos = new Float32Array(MOTES * 3);
+for (let i = 0; i < MOTES; i++) {
+  const r = 1.5 + Math.random() * 7, a = Math.random() * Math.PI * 2;
+  moteBase.set([Math.cos(a) * r, 0.3 + Math.random() * 2.8, Math.sin(a) * r], i * 3);
+}
+const moteGeo = new THREE.BufferGeometry().setAttribute('position', new THREE.BufferAttribute(motePos, 3));
+const moteTex = (() => {
+  const c = document.createElement('canvas'); c.width = c.height = 64;
+  const g = c.getContext('2d'), grd = g.createRadialGradient(32, 32, 0, 32, 32, 32);
+  grd.addColorStop(0, 'rgba(255,248,230,1)'); grd.addColorStop(0.4, 'rgba(255,240,210,0.35)'); grd.addColorStop(1, 'rgba(255,240,210,0)');
+  g.fillStyle = grd; g.fillRect(0, 0, 64, 64);
+  return new THREE.CanvasTexture(c);
+})();
+const motes = new THREE.Points(moteGeo, zenMat(new THREE.PointsMaterial({ size: 0.05, map: moteTex, depthWrite: false, blending: THREE.AdditiveBlending, fog: false }), 0.8));
+motes.frustumCulled = false;
+zenGroup.add(motes);
+
+// Virtual table (only drawn in the zen world, where you can't see the real one).
+const zenWood = zenMat(new THREE.MeshStandardMaterial({ color: 0xc9a47e, roughness: 0.75 }));
+function buildZenTable(center, quat, w, d) {
+  const g = new THREE.Group();
+  g.position.copy(center); g.quaternion.copy(quat);
+  const top = new THREE.Mesh(new THREE.BoxGeometry(w, 0.03, d), zenWood);
+  top.position.y = -0.015; top.receiveShadow = true;
+  g.add(top);
+  const legH = Math.max(0.05, center.y - 0.03);
+  for (const [sx, sz] of [[-1, -1], [1, -1], [1, 1], [-1, 1]]) {
+    const leg = new THREE.Mesh(new THREE.BoxGeometry(0.04, legH, 0.04), zenWood);
+    leg.position.set(sx * (w / 2 - 0.05), -0.03 - legH / 2, sz * (d / 2 - 0.05));
+    g.add(leg);
+  }
+  g.traverse(o => { o.renderOrder = -1; });
+  g.visible = false;
+  return g;
+}
+
+// In the zen world your real hands are hidden, so the hand occluders become visible soft hands.
+const handMat = new THREE.MeshStandardMaterial({ color: 0xf1e4d8, roughness: 0.6 });
+
+let zenOn = false, zenAmt = 0, zenPreview = false;
+function setZen(on) { zenOn = on; }
+function updateZen(dt, time) {
+  // never during table measuring — you need to see the real table then
+  const allowed = renderer.xr.isPresenting ? phase === 'play' : zenPreview;
+  const target = zenOn && allowed ? 1 : 0;
+  zenAmt += (target - zenAmt) * (1 - Math.exp(-dt * 2.5));
+  if (Math.abs(target - zenAmt) < 0.003) zenAmt = target;
+  const show = zenAmt > 0.003;
+  zenGroup.visible = show;
+  if (table?.zenTable) table.zenTable.visible = show;
+  for (const m of zenMats) {
+    if (m.uniforms) m.uniforms.opacity.value = zenAmt * m.userData.base;
+    else m.opacity = zenAmt * m.userData.base;
+  }
+  scene.fog.near = show ? 6 : 1e4; scene.fog.far = show ? 38 : 2e4;
+  const handsVisible = zenAmt > 0.5;
+  occSpheres.material = occBones.material = handsVisible ? handMat : occluderMat;
+  if (show) {
+    const t = time / 1000;
+    for (let i = 0; i < MOTES; i++) {
+      const k = i * 3;
+      motePos[k] = moteBase[k] + Math.sin(t * 0.13 + i) * 0.25;
+      motePos[k + 1] = moteBase[k + 1] + Math.sin(t * 0.21 + i * 1.7) * 0.15;
+      motePos[k + 2] = moteBase[k + 2] + Math.cos(t * 0.11 + i * 0.7) * 0.25;
+    }
+    moteGeo.attributes.position.needsUpdate = true;
+  }
+}
+
+// ---------- Hand menu (look at your left palm) ----------
+const MENU_BTNS = [
+  { id: 'music', label: () => `Music: ${music.enabled ? 'On' : 'Off'}`, on: () => music.enabled },
+  { id: 'zen', label: () => `Zen world: ${zenOn ? 'On' : 'Off'}`, on: () => zenOn },
+  { id: 'pile', label: () => 'New pile' },
+  { id: 'measure', label: () => 'Re-measure' },
+];
+const BTN_W = 0.075, BTN_H = 0.036, BTN_GAP = 0.008;
+const menu = new THREE.Group(); menu.visible = false; scene.add(menu);
+const plate = new THREE.Mesh(new THREE.PlaneGeometry(2 * BTN_W + 3 * BTN_GAP, 2 * BTN_H + 3 * BTN_GAP),
+  new THREE.MeshBasicMaterial({ color: 0x14161c, transparent: true, opacity: 0.7, fog: false }));
+plate.renderOrder = 5; menu.add(plate);
+for (const [i, b] of MENU_BTNS.entries()) {
+  b.canvas = document.createElement('canvas'); b.canvas.width = 512; b.canvas.height = 246;
+  b.tex = new THREE.CanvasTexture(b.canvas); b.tex.colorSpace = THREE.SRGBColorSpace;
+  b.mesh = new THREE.Mesh(new THREE.PlaneGeometry(BTN_W, BTN_H), new THREE.MeshBasicMaterial({ map: b.tex, transparent: true, fog: false }));
+  b.x = (i % 2 - 0.5) * (BTN_W + BTN_GAP); b.y = (0.5 - Math.floor(i / 2)) * (BTN_H + BTN_GAP);
+  b.mesh.position.set(b.x, b.y, 0.002); b.mesh.renderOrder = 6;
+  menu.add(b.mesh);
+  b.drawn = '';
+}
+function drawButton(b, hover) {
+  const key = b.label() + hover;
+  if (key === b.drawn) return;
+  b.drawn = key;
+  const c = b.canvas.getContext('2d');
+  c.clearRect(0, 0, 512, 246);
+  const on = b.on?.();
+  c.fillStyle = on === undefined ? (hover ? '#6d8fd0' : '#4d6fae') : on ? (hover ? '#5cc4b8' : '#3a9e93') : (hover ? '#5b6170' : '#3c414d');
+  c.beginPath(); c.roundRect(6, 6, 500, 234, 56); c.fill();
+  c.fillStyle = '#fff'; c.textAlign = 'center'; c.textBaseline = 'middle';
+  c.font = 'bold 64px system-ui, sans-serif'; c.fillText(b.label(), 256, 126);
+  b.tex.needsUpdate = true;
+}
+MENU_BTNS.forEach(b => drawButton(b, false));
+
+const menuState = { open: false, lastZ: 1, lastPress: 0, ctrlOpen: false };
+function pressButton(b, time) {
+  music.click();
+  if (b.id === 'music') music.set(!music.enabled);
+  else if (b.id === 'zen') setZen(!zenOn);
+  else if (b.id === 'pile') { dropBlocks(200); flashPanel('Fresh pile!', '', 1500); }
+  else if (b.id === 'measure') { menuState.open = false; menu.visible = false; startFind(time); }
+}
+function updateMenu(time, headPos, dt) {
+  const states = [...inputs.values()];
+  const left = states.find(s => s.handedness === 'left'), right = states.find(s => s.handedness === 'right');
+  let anchor = null;
+  if (phase === 'play' && left) {
+    if (left.isHand) {
+      if (left.palmNormal) {
+        const facing = left.palmNormal.dot(headPos.clone().sub(left.palmCenter).normalize());
+        menuState.open = left.open && !left.pinch && !left.held && facing > (menuState.open ? 0.35 : 0.6);
+        anchor = left.palmCenter.clone().addScaledVector(left.palmNormal, 0.07).add(new THREE.Vector3(0, 0.03, 0));
+      } else menuState.open = false;
+    } else {   // controller: X button opens/closes the menu above the left controller
+      if (left.menuPressed) menuState.ctrlOpen = !menuState.ctrlOpen;
+      menuState.open = menuState.ctrlOpen;
+      anchor = left.pos.clone().add(new THREE.Vector3(0, 0.1, 0));
+    }
+  } else menuState.open = false;
+  menu.visible = menuState.open;
+  if (!menuState.open) { menuState.lastZ = 1; return; }
+
+  const poker = right ? (right.isHand ? right.tip : right.pos) : null;
+  // hold the menu still while your other finger is reaching for it
+  const reaching = poker && poker.distanceTo(menu.position) < 0.15;
+  if (!reaching || !menu.userData.placed) {
+    menu.position.lerp(anchor, menu.userData.placed ? 1 - Math.exp(-dt * 12) : 1);
+    menu.lookAt(headPos);
+    menu.userData.placed = true;
+  }
+  menu.updateMatrixWorld();
+  let hoverBtn = null;
+  if (poker) {
+    const local = menu.worldToLocal(poker.clone());
+    hoverBtn = MENU_BTNS.find(b => Math.abs(local.x - b.x) < BTN_W / 2 && Math.abs(local.y - b.y) < BTN_H / 2 && local.z < 0.04 && local.z > -0.03) || null;
+    if (hoverBtn && local.z < 0.006 && menuState.lastZ >= 0.006 && time - menuState.lastPress > 450) {
+      menuState.lastPress = time;
+      pressButton(hoverBtn, time);
+    }
+    menuState.lastZ = hoverBtn ? local.z : 1;
+  }
+  MENU_BTNS.forEach(b => drawButton(b, b === hoverBtn));
+}
+
+// ---------- Table detection ----------
+function findTablePlane(frame, ref, headPos) {
+  const planes = frame.detectedPlanes;
+  window.__planes = planes ? [...planes].map(p => {
+    const pose = frame.getPose(p.planeSpace, ref);
+    return { label: p.semanticLabel, orient: p.orientation, pos: pose && [pose.transform.position.x, pose.transform.position.y, pose.transform.position.z].map(n => +n.toFixed(2)) };
+  }) : 'unsupported';
+  if (!planes || planes.size === 0) return null;
+  let best = null, bestScore = Infinity;
+  for (const plane of planes) {
+    if (plane.orientation !== 'horizontal') continue;
+    const pose = frame.getPose(plane.planeSpace, ref);
+    if (!pose) continue;
+    // Only trust surfaces labeled as a table/desk that are within reach.
+    // (A saved room scan can be from a different room — then we fall back to touch.)
+    const label = (plane.semanticLabel || '').toLowerCase();
+    if (label !== 'table' && label !== 'desk') continue;
+    const pp = pose.transform.position;
+    if (Math.hypot(pp.x - headPos.x, pp.z - headPos.z) > 2.0) continue;
+    let minX = Infinity, maxX = -Infinity, minZ = Infinity, maxZ = -Infinity;
+    for (const p of plane.polygon) { minX = Math.min(minX, p.x); maxX = Math.max(maxX, p.x); minZ = Math.min(minZ, p.z); maxZ = Math.max(maxZ, p.z); }
+    const w = maxX - minX, d = maxZ - minZ;
+    if (w < 0.2 || d < 0.2) continue;
+    const m = new THREE.Matrix4().fromArray(pose.transform.matrix);
+    const center = new THREE.Vector3((minX + maxX) / 2, 0, (minZ + maxZ) / 2).applyMatrix4(m);
+    let quat = q4(pose.transform.orientation);
+    if (UP.clone().applyQuaternion(quat).y < 0) quat.multiply(new THREE.Quaternion().setFromAxisAngle(new THREE.Vector3(1, 0, 0), Math.PI));
+    const dist = Math.hypot(center.x - headPos.x, center.z - headPos.z);
+    if (dist > 2.0) continue;
+    const score = dist;                       // closest table wins
+    if (score < bestScore) { bestScore = score; best = { center, quat, w, d }; }
+  }
+  return best;
+}
+
+function handleTouch(st, src, started, time, headPos, headFwd) {
+  if (time - findStart < 1500 || !st.tip) return 0;
+  const yawQuat = cornerYaw || new THREE.Quaternion().setFromAxisAngle(UP, Math.atan2(-headFwd.x, -headFwd.z));
+  // the second corner must be a real distance away from the first
+  const farEnough = p => !cornerA || Math.hypot(p.x - cornerA.x, p.z - cornerA.z) > 0.25;
+  if (!src.hand) {      // controller: pull the trigger while resting it on each corner
+    if (started) { const p = st.pos.clone().add(new THREE.Vector3(0, -0.03, 0)); if (farEnough(p)) placeCorner(p, yawQuat); }
+    return 0;
+  }
+  const tip = st.tip;
+  const toTip = tip.clone().sub(headPos);
+  const inFront = new THREE.Vector3(toTip.x, 0, toTip.z).dot(headFwd) > 0.15;
+  const plausible = inFront && headPos.y - tip.y > 0.15 && !st.pinch;
+  if (plausible) updateCornerPreview(tip);
+  if (!plausible || !st.touchAnchor || tip.distanceTo(st.touchAnchor) > 0.012) { st.touchAnchor = tip.clone(); st.touchStart = time; }
+  if (!plausible || !farEnough(tip)) return 0;
+  const progress = THREE.MathUtils.clamp(((time - st.touchStart) / 1000 - 0.3) / 1.2, 0, 1);
+  if (progress > 0) showRing(0, tip.clone().add(new THREE.Vector3(0, -0.006, 0)), progress);
+  if (progress >= 1) placeCorner(tip.clone().add(new THREE.Vector3(0, -0.008, 0)), yawQuat);
+  return progress;
+}
+
+// ---------- Grabbing ----------
+function tryGrab(st) {
+  let best = null, bestD = GRAB_RADIUS;
+  for (const b of blocks) {
+    if (!b.active) continue;
+    const d = blockDistance(b, st.pos);
+    if (d < bestD) { bestD = d; best = b; }
+  }
+  if (!best) return;
+  if (best.heldBy) release(best.heldBy);       // hand-to-hand pass
+  const body = best.body;
+  body.type = CANNON.Body.KINEMATIC;
+  body.allowSleep = false; body.wakeUp();
+  body.velocity.set(0, 0, 0); body.angularVelocity.set(0, 0, 0);
+  const inv = st.quat.clone().invert();
+  st.offsetQuat = inv.clone().multiply(q4(body.quaternion));
+  st.offsetPos = v3(body.position).sub(st.pos).applyQuaternion(inv);
+  st.held = best; best.heldBy = st;
+}
+
+function release(st) {
+  const b = st.held;
+  if (!b) return;
+  const body = b.body;
+  body.type = CANNON.Body.DYNAMIC;
+  body.allowSleep = true;
+  const v = st.vel.clone(); if (v.length() > 3) v.setLength(3);
+  body.velocity.set(v.x, v.y, v.z);
+  body.angularVelocity.scale(0.3, body.angularVelocity);
+  body.wakeUp();
+  b.heldBy = null; b.target = null; st.held = null;
+}
+
+function driveHeld(st, dt) {
+  const b = st.held;
+  if (!b) return;
+  const tPos = st.offsetPos.clone().applyQuaternion(st.quat).add(st.pos);
+  const tQuat = st.quat.clone().multiply(st.offsetQuat);
+  const body = b.body;
+  const lin = tPos.clone().sub(v3(body.position)).divideScalar(dt);
+  body.velocity.set(lin.x, lin.y, lin.z);
+  const dq = tQuat.clone().multiply(q4(body.quaternion).invert());
+  if (dq.w < 0) dq.set(-dq.x, -dq.y, -dq.z, -dq.w);
+  const angle = 2 * Math.acos(Math.min(1, dq.w)), s = Math.sqrt(1 - dq.w * dq.w);
+  if (s > 1e-4) body.angularVelocity.set(dq.x / s * angle / dt, dq.y / s * angle / dt, dq.z / s * angle / dt);
+  else body.angularVelocity.set(0, 0, 0);
+  b.target = { tPos, tQuat };
+}
+
+function updateInputs(frame, ref, dt, time, headPos, headFwd) {
+  const seen = new Set();
+  rings.forEach(r => r.visible = false);
+  for (const src of frame.session.inputSources) {
+    let st = inputs.get(src);
+    if (!st) { st = { pinch: false, held: null, lastPos: null, vel: new THREE.Vector3(), touchAnchor: null, touchStart: 0 }; inputs.set(src, st); }
+    let pos, quat, tip = null, pinchNow;
+    if (src.hand) {
+      const tipP = frame.getJointPose(src.hand.get('index-finger-tip'), ref);
+      const thumbP = frame.getJointPose(src.hand.get('thumb-tip'), ref);
+      const wristP = frame.getJointPose(src.hand.get('wrist'), ref);
+      if (!tipP || !thumbP || !wristP) continue;
+      tip = v3(tipP.transform.position);
+      const thumb = v3(thumbP.transform.position);
+      const gap = tip.distanceTo(thumb);
+      pos = tip.clone().add(thumb).multiplyScalar(0.5);
+      quat = q4(wristP.transform.orientation);
+      pinchNow = st.pinch ? gap < PINCH_OFF : gap < PINCH_ON;
+      // Palm direction from the wrist→index and wrist→pinky knuckle vectors (used by the hand menu).
+      const ip = frame.getJointPose(src.hand.get('index-finger-phalanx-proximal'), ref);
+      const pp = frame.getJointPose(src.hand.get('pinky-finger-phalanx-proximal'), ref);
+      const mt = frame.getJointPose(src.hand.get('middle-finger-tip'), ref);
+      st.palmNormal = null;
+      if (ip && pp && mt) {
+        const w = v3(wristP.transform.position);
+        const a = v3(ip.transform.position).sub(w), b = v3(pp.transform.position).sub(w);
+        st.palmNormal = (src.handedness === 'left' ? b.clone().cross(a) : a.clone().cross(b)).normalize();
+        st.open = v3(mt.transform.position).distanceTo(w) > 0.13;
+        st.palmCenter = w.clone().add(a.add(b).multiplyScalar(0.5 * 0.6));
+      }
+    } else if (src.gripSpace) {
+      const p = frame.getPose(src.gripSpace, ref);
+      if (!p) continue;
+      pos = v3(p.transform.position); quat = q4(p.transform.orientation); tip = pos;
+      const btn = src.gamepad?.buttons || [];
+      pinchNow = !!(btn[0]?.pressed || btn[1]?.pressed);
+      const xPressed = !!btn[4]?.pressed;            // X / A button
+      st.menuPressed = xPressed && !st.xWasPressed; st.xWasPressed = xPressed;
+    } else continue;
+    seen.add(src);
+    st.handedness = src.handedness; st.isHand = !!src.hand;
+    st.pos = pos; st.quat = quat; st.tip = tip;
+    if (st.lastPos && dt > 0) st.vel.lerp(pos.clone().sub(st.lastPos).divideScalar(dt), 0.4);
+    st.lastPos = pos.clone();
+    const started = pinchNow && !st.pinch, ended = !pinchNow && st.pinch;
+    st.pinch = pinchNow;
+
+    if (phase === 'find') {
+      handleTouch(st, src, started, time, headPos, headFwd);
+    } else if (phase === 'play') {
+      if (started) tryGrab(st);
+      if (ended) release(st);
+    }
+  }
+  for (const [src, st] of inputs) if (!seen.has(src)) { release(st); inputs.delete(src); }
+  updateMenu(time, headPos, dt);
+
+  // Hover glow: light up the block you'd grab if you pinched now.
+  const hover = new Set();
+  if (phase === 'play') for (const st of inputs.values()) {
+    if (st.held || !st.pos) continue;
+    let best = null, bestD = GRAB_RADIUS + 0.015;
+    for (const b of blocks) { if (!b.active || b.heldBy) continue; const d = blockDistance(b, st.pos); if (d < bestD) { bestD = d; best = b; } }
+    if (best) hover.add(best);
+  }
+  for (const b of blocks) b.mesh.material.emissive.setHex(hover.has(b) || b.heldBy ? 0x2a2a2a : 0x000000);
+}
+
+// ---------- Hand occlusion ----------
+// An invisible copy of each tracked hand (spheres on joints + capsules along bones) that
+// writes only depth. Blocks behind your real hand get hidden, so your hand appears in front.
+const FINGERS = ['index-finger', 'middle-finger', 'ring-finger', 'pinky-finger'];
+const JOINTS = ['wrist', 'thumb-metacarpal', 'thumb-phalanx-proximal', 'thumb-phalanx-distal', 'thumb-tip',
+  ...FINGERS.flatMap(f => ['metacarpal', 'phalanx-proximal', 'phalanx-intermediate', 'phalanx-distal', 'tip'].map(s => `${f}-${s}`))];
+const BONES = [
+  ['wrist', 'thumb-metacarpal'], ['thumb-metacarpal', 'thumb-phalanx-proximal'],
+  ['thumb-phalanx-proximal', 'thumb-phalanx-distal'], ['thumb-phalanx-distal', 'thumb-tip'],
+  ...FINGERS.flatMap(f => [['wrist', `${f}-metacarpal`], [`${f}-metacarpal`, `${f}-phalanx-proximal`],
+    [`${f}-phalanx-proximal`, `${f}-phalanx-intermediate`], [`${f}-phalanx-intermediate`, `${f}-phalanx-distal`],
+    [`${f}-phalanx-distal`, `${f}-tip`]]),
+  // webbing across the palm and knuckles
+  ...[0, 1, 2].flatMap(i => [[`${FINGERS[i]}-metacarpal`, `${FINGERS[i + 1]}-metacarpal`],
+    [`${FINGERS[i]}-phalanx-proximal`, `${FINGERS[i + 1]}-phalanx-proximal`],
+    [`${FINGERS[i]}-metacarpal`, `${FINGERS[i + 1]}-phalanx-proximal`]]),
+  ['thumb-metacarpal', 'index-finger-metacarpal'], ['thumb-phalanx-proximal', 'index-finger-phalanx-proximal'],
+  ['thumb-metacarpal', 'index-finger-phalanx-proximal'],
+];
+const occluderMat = new THREE.MeshBasicMaterial({ colorWrite: false });
+const MAX_HANDS = 2;
+const occSpheres = new THREE.InstancedMesh(new THREE.SphereGeometry(1, 10, 8), occluderMat, JOINTS.length * MAX_HANDS);
+const occBones = new THREE.InstancedMesh(new THREE.CylinderGeometry(1, 1, 1, 10, 1, true), occluderMat, (BONES.length + 1) * MAX_HANDS);
+for (const m of [occSpheres, occBones]) { m.renderOrder = -1; m.frustumCulled = false; m.count = 0; scene.add(m); }
+
+const _m = new THREE.Matrix4(), _p = new THREE.Vector3(), _q = new THREE.Quaternion(), _s = new THREE.Vector3();
+const _a = new THREE.Vector3(), _b = new THREE.Vector3(), _d = new THREE.Vector3();
+function setBone(i, a, b, r) {
+  _d.subVectors(b, a); const len = _d.length();
+  if (len < 1e-4) { occBones.setMatrixAt(i, _m.makeScale(0, 0, 0)); return; }
+  _q.setFromUnitVectors(UP, _d.divideScalar(len));
+  _p.addVectors(a, b).multiplyScalar(0.5);
+  occBones.setMatrixAt(i, _m.compose(_p, _q, _s.set(r, len, r)));
+}
+function updateOccluders(frame, ref) {
+  let si = 0, bi = 0;
+  for (const src of frame.session.inputSources) {
+    if (!src.hand || si >= JOINTS.length * MAX_HANDS) continue;
+    const pos = {}, rad = {};
+    let ok = true;
+    for (const name of JOINTS) {
+      const jp = frame.getJointPose(src.hand.get(name), ref);
+      if (!jp) { ok = false; break; }
+      pos[name] = v3(jp.transform.position); rad[name] = (jp.radius || 0.008) * 0.95;
+      if (name === 'wrist') pos.__wristQuat = q4(jp.transform.orientation);
+    }
+    if (!ok) continue;
+    for (const name of JOINTS) occSpheres.setMatrixAt(si++, _m.compose(pos[name], _q.identity(), _s.setScalar(rad[name])));
+    for (const [ja, jb] of BONES) setBone(bi++, pos[ja], pos[jb], Math.max(0.006, Math.min(rad[ja], rad[jb])));
+    // forearm: runs from the wrist away from the fingers (+Z in the wrist's frame)
+    _a.copy(pos.wrist); _b.set(0, 0, 0.28).applyQuaternion(pos.__wristQuat).add(_a);
+    setBone(bi++, _a, _b, 0.027);
+  }
+  occSpheres.count = si; occBones.count = bi;
+  occSpheres.instanceMatrix.needsUpdate = occBones.instanceMatrix.needsUpdate = true;
+}
+
+// ---------- Main loop ----------
+const clock = new THREE.Clock();
+renderer.setAnimationLoop((time, frame) => {
+  const dt = Math.min(clock.getDelta(), 0.05);
+
+  if (frame) {
+    const ref = renderer.xr.getReferenceSpace();
+    updateOccluders(frame, ref);
+    const viewer = frame.getViewerPose(ref);
+    if (viewer) {
+      const headPos = v3(viewer.transform.position);
+      const headFwd = new THREE.Vector3(0, 0, -1).applyQuaternion(q4(viewer.transform.orientation)).setY(0).normalize();
+      if (phase === 'find') {
+        const found = findTablePlane(frame, ref, headPos);
+        if (found) { setTable(found.center, found.quat, found.w, found.d); tableFound(); }
+        else if (time - findStart > 1500) {
+          if (!cornerA) setPanel('Touch one corner of your table', 'Rest a fingertip there and hold still');
+          else setPanel('Now the opposite corner', 'Touch the diagonal corner and hold still');
+        }
+      }
+      updateInputs(frame, ref, dt, time, headPos, headFwd);
+      if (panel.visible) followHead(headPos, headFwd, dt);
+    }
+  }
+
+  if (!frame) menu.visible = false;
+  updateZen(dt, time);
+  for (const st of inputs.values()) driveHeld(st, Math.max(dt, 1 / 240));
+  world.step(1 / 120, dt, 10);
+
+  for (const b of blocks) {
+    if (!b.active) continue;
+    if (b.target) { // keep held blocks exactly in your hand
+      b.body.position.set(b.target.tPos.x, b.target.tPos.y, b.target.tPos.z);
+      b.body.quaternion.set(b.target.tQuat.x, b.target.tQuat.y, b.target.tQuat.z, b.target.tQuat.w);
+    }
+    b.mesh.position.copy(b.body.position);
+    b.mesh.quaternion.copy(b.body.quaternion);
+    // Knocked off the table? Drop it back from the sky after a moment.
+    if (table && !b.heldBy && b.body.position.y < table.center.y - 0.2) {
+      b.fallenAt ??= time;
+      if (time - b.fallenAt > 2500 || b.body.position.y < -2) spawnBlock(b, { respawn: true });
+    } else b.fallenAt = null;
+  }
+
+  if (flash) {
+    flash.t += dt;
+    const a = Math.max(0, 1 - flash.t / 2);
+    flash.lineMat.opacity = a; flash.fillMat.opacity = 0.18 * a;
+    if (a === 0) { scene.remove(flash.group); flash = null; }
+  }
+
+  renderer.render(scene, camera);
+});
+
+// Debug handle (read from the Mac over adb/DevTools).
+window.tb = { debug: { world, blocks, CANNON, spawnBlock, hideBlocks, music, setZen, menu, MENU_BTNS, camera,
+    set zenPreview(v) { zenPreview = v; }, get zenAmt() { return zenAmt; }, get table() { return table; } },
+  get state() {
+    return {
+      phase, presenting: renderer.xr.isPresenting, panel: panel.visible, panelText,
+      panelPos: panel.position.toArray().map(n => +n.toFixed(2)),
+      table: table && { center: table.center.toArray().map(n => +n.toFixed(2)), w: +table.w.toFixed(2), d: +table.d.toFixed(2) },
+      blocks: blocks.filter(b => b.active).map(b => b.mesh.position.toArray().map(n => +n.toFixed(2))),
+      inputs: [...inputs.values()].map(s => s.pos && s.pos.toArray().map(n => +n.toFixed(2))),
+      planes: window.__planes || null,
+      occluders: { spheres: occSpheres.count, bones: occBones.count },
+    };
+  },
+};
+
+// ---------- Start button ----------
+const btn = document.getElementById('start'), msg = document.getElementById('msg');
+const supported = navigator.xr && await navigator.xr.isSessionSupported('immersive-ar').catch(() => false);
+if (supported) {
+  btn.disabled = false;
+  btn.textContent = 'Start mixed reality';
+  msg.textContent = 'Allow hand tracking and spatial data when asked. Pinch blocks to pick them up. Look at your left palm for the menu (music, zen world).';
+} else {
+  btn.textContent = 'Needs a Quest headset';
+  msg.textContent = 'This is a preview. Open this page in the Meta Quest Browser to play in mixed reality.';
+}
+btn.addEventListener('click', async () => {
+  try {
+    music.start();   // must happen during the tap so the browser allows audio
+    const session = await navigator.xr.requestSession('immersive-ar', {
+      requiredFeatures: ['local-floor'],
+      optionalFeatures: ['hand-tracking', 'plane-detection'],
+    });
+    await renderer.xr.setSession(session);
+    startFind(performance.now());
+    session.addEventListener('end', () => { inputs.clear(); music.stop(); startPreview(); });
+  } catch (e) {
+    msg.textContent = 'Could not start: ' + e.message;
+  }
+});
+
+startPreview();
+</script>
+<script>
+  if ('serviceWorker' in navigator && location.protocol === 'https:') navigator.serviceWorker.register('sw.js');
+</script>
+</body>
+</html>
