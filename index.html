@@ -998,12 +998,15 @@ if (supported) {
   btn.textContent = 'Needs a Quest headset';
   msg.textContent = 'This is a preview. Open this page in the Meta Quest Browser to play in mixed reality.';
 }
-async function startXR() {
+async function startXR(asApp = false) {
   try {
     music.start();   // must happen during the tap so the browser allows audio
+    // As an installed app, the browser can't show its "spatial data" prompt over the
+    // launch screen, so asking for table detection would hang forever. Skip it there:
+    // the table is measured by touching two corners instead.
     const session = await navigator.xr.requestSession('immersive-ar', {
       requiredFeatures: ['local-floor'],
-      optionalFeatures: ['hand-tracking', 'plane-detection'],
+      optionalFeatures: asApp ? ['hand-tracking'] : ['hand-tracking', 'plane-detection'],
     });
     await renderer.xr.setSession(session);
     startFind(performance.now());
@@ -1017,11 +1020,11 @@ async function startXR() {
     return false;
   }
 }
-btn.addEventListener('click', startXR);
+btn.addEventListener('click', () => startXR());
 
 // Installed as a Quest app: go straight into mixed reality, keeping the button as a fallback.
 const installedApp = matchMedia('(display-mode: standalone)').matches || 'getDigitalGoodsService' in window;
-if (supported && installedApp) startXR().then(ok => {
+if (supported && installedApp) startXR(true).then(ok => {
   if (!ok) msg.textContent = 'Tap Start to enter mixed reality.';
 });
 
