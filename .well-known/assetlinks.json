@@ -1,0 +1,5 @@
+[{
+  "relation": ["delegate_permission/common.handle_all_urls"],
+  "target": { "namespace": "android_app", "package_name": "io.github.spencer0706.tableblocks",
+              "sha256_cert_fingerprints": ["C3:DD:28:44:D7:51:97:0D:A1:56:B5:FA:AD:54:F3:6B:DF:D2:90:44:33:77:17:9A:A8:21:17:AA:6C:1D:31:49"] }
+}]
