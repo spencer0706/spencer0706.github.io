@@ -1,6 +1,6 @@
 // Offline support: app files are fetched fresh when online (so updates arrive)
 // and served from the cache when offline. Versioned CDN libraries are cache-first.
-const CACHE = 'table-blocks-v1';
+const CACHE = 'table-blocks-v2';
 const APP = ['/', '/index.html', '/manifest.webmanifest', '/icon-192.png', '/icon-512.png'];
 const LIBS = [
   'https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js',

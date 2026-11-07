@@ -477,6 +477,7 @@ const music = (() => {
   return {
     get enabled() { return enabled; },
     start() { if (!ctx) init(); ctx.resume(); if (enabled) play(); },   // call from a tap (browser audio rule)
+    wake() { if (ctx && ctx.state !== 'running') ctx.resume(); },   // retry audio after a pinch/trigger
     stop() { quiet(); },
     set(on) { enabled = on; on ? play() : quiet(); },
     click() {   // soft tick for menu presses
@@ -997,7 +998,7 @@ if (supported) {
   btn.textContent = 'Needs a Quest headset';
   msg.textContent = 'This is a preview. Open this page in the Meta Quest Browser to play in mixed reality.';
 }
-btn.addEventListener('click', async () => {
+async function startXR() {
   try {
     music.start();   // must happen during the tap so the browser allows audio
     const session = await navigator.xr.requestSession('immersive-ar', {
@@ -1006,10 +1007,22 @@ btn.addEventListener('click', async () => {
     });
     await renderer.xr.setSession(session);
     startFind(performance.now());
+    // When launched as an app there is no tap, so audio may start suspended:
+    // a pinch or trigger press inside XR counts as a user gesture.
+    session.addEventListener('selectstart', () => music.wake());
     session.addEventListener('end', () => { inputs.clear(); music.stop(); startPreview(); });
+    return true;
   } catch (e) {
     msg.textContent = 'Could not start: ' + e.message;
+    return false;
   }
+}
+btn.addEventListener('click', startXR);
+
+// Installed as a Quest app: go straight into mixed reality, keeping the button as a fallback.
+const installedApp = matchMedia('(display-mode: standalone)').matches || 'getDigitalGoodsService' in window;
+if (supported && installedApp) startXR().then(ok => {
+  if (!ok) msg.textContent = 'Tap Start to enter mixed reality.';
 });
 
 startPreview();
